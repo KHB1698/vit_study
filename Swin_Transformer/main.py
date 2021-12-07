@@ -1,5 +1,6 @@
 import paddle
 import paddle.nn as nn
+paddle.set_device('cpu')
 
 
 class PatchEmbedding(nn.Layer):
@@ -64,7 +65,7 @@ def windows_partition(x, window_size):
     x = x.reshape([B, H//window_size, window_size, W//window_size, window_size, C])
     x = x.transpose([0, 1, 3, 2, 4, 5])
     # [B, H/window_size, W/window_size, window_size, window_size, C]
-    x = x.reshape([[-1, window_size, window_size, C]])  # ? 注意这里的reshape，两个中括号
+    x = x.reshape([-1, window_size, window_size, C])
     # [B*H/window_size*W/window_size, window_size, window_size, C]
     return x
 
@@ -76,3 +77,91 @@ def windows_reverse(windows, window_size, H, W):
     x = x.transpose([0, 1, 3, 2, 4, 5])
     x = x.reshape([B, H, W, -1])
     return x
+
+
+class WindowAttention(nn.Layer):
+    def __init__(self, dim, window_size, num_heads):
+        super().__init__()
+        self.dim = dim
+        self.dim_head = dim // num_heads
+        self.num_heads = num_heads
+        self.scale = self.dim_head ** -0.5
+        self.softmax = nn.Softmax(-1)
+        self.qkv = nn.Linear(dim, 3 * dim)
+        self.proj = nn.Linear(dim, dim)
+
+    def transpose_multi_head(self, x):
+        new_shape = x.shape[:-1] + [self.num_heads, self.dim_head]
+        x = x.reshape(new_shape)
+        x = x.transpose([0, 2, 1, 3])  # [B, num_heads, num_patches, dim_head]
+        return x
+
+    def forward(self, x):
+        B, N, C = x.shape
+        # x:[B,num_patches,embed_dim]
+        qkv = self.qkv(x).chunk(3, -1)
+        q, k, v = map(self.transpose_multi_head, qkv)
+
+        q = q * self.scale
+        attn = paddle.matmul(q, k, transpose_y=True)
+        attn = self.softmax(attn)
+
+        out = paddle.matmul(attn, v)  # [B, num_heads, num_patches, dim_head]
+        out = out.transpose([0, 2, 1, 3])  # [B, num_patches, num_heads, dim_head] num_heads*dim_head=embed_dim
+        out = out.reshape([B, N, C])
+        out = self.proj(out)
+        return out
+
+
+class SwinBlock(nn.Layer):
+    def __init__(self, dim, input_resolution, num_heads, window_size):
+        super().__init__()
+        self.dim = dim
+        self.resolution = input_resolution
+        self.window_size = window_size
+        self.attn_norm = nn.LayerNorm(dim)
+        self.attn = WindowAttention(dim, window_size, num_heads)
+
+        self.mlp_norm = nn.LayerNorm(dim)
+        self.mlp = Mlp(dim)
+
+    def forward(self, x):
+        H, W = self.resolution
+        B, N, C = x.shape
+
+        h = x
+        x = self.attn_norm(x)
+
+        x = x.reshape([B, H, W, C])
+        x_windows = windows_partition(x, self.window_size)
+        # [B*num_patches, window_size, window_size, C]
+        x_windows = x_windows.reshape([-1, self.window_size*self.window_size, C])
+        attn_windows = self.attn(x_windows)
+        attn_windows = attn_windows.reshape([-1, self.window_size, self.window_size, C])
+        x = windows_reverse(attn_windows, self.window_size, H, W)
+        # [B, H, W, C]
+        x = x.reshape([B, H*W, C])
+        x = x + h
+        h = x
+        x = self.mlp_norm(x)
+        x = self.mlp(x)
+        x = x + h
+        return x
+
+
+def main():
+    t = paddle.randn([4, 3, 224, 224])
+    patch_embedding = PatchEmbedding(patch_size=4, embed_dim=96)
+    swin_block = SwinBlock(dim=96, input_resolution=[56, 56], num_heads=4, window_size=7)
+    patch_merging = PatchMerging(input_resolution=[56,56], dim=96)
+    
+    out = patch_embedding(t) # [4, 56*56, 96]
+    print('patch_embedding:', out.shape)
+    out = swin_block(out) # [4, 56*56, 96]
+    print('swin_block:', out.shape)
+    out = patch_merging(out) # [4,28*28,96*2]
+    print('patch_merging:', out.shape)
+    
+    
+if __name__ == '__main__':
+    main()
