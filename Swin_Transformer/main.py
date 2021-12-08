@@ -149,19 +149,40 @@ class SwinBlock(nn.Layer):
         return x
 
 
+# generator attn mask
+def generate_mask(window_size=4, shift_size=2, input_resolution=(8, 8)):
+    H, W = input_resolution
+    img_mask = paddle.zeros([1, H, W, 1])
+    h_slices = [slice(0, -window_size),
+                slice(-window_size, -shift_size),
+                slice(-shift_size, None)]  # a[slice(...)] = a[0:-window_size]
+    w_slices = [slice(0, -window_size),
+                slice(-window_size, -shift_size),
+                slice(-shift_size, None)]  # a[slice(...)] = a[0:-window_size]
+    cnt = 0
+    for h in h_slices:
+        for w in w_slices:
+            img_mask[:, h, w, :] = cnt
+            cnt += 1
+    window_mask = windows_partition(img_mask, window_size=window_size)
+    window_mask = window_mask.reshape([-1, window_size*window_size, 1]) # 拉平
+    # 列向量减行向量[n,1,ws*ws] - [n,ws*ws,1]
+    attn_mask = window_mask.unsqueeze(1)-window_mask.unsqueeze(2)
+
+
 def main():
     t = paddle.randn([4, 3, 224, 224])
     patch_embedding = PatchEmbedding(patch_size=4, embed_dim=96)
     swin_block = SwinBlock(dim=96, input_resolution=[56, 56], num_heads=4, window_size=7)
-    patch_merging = PatchMerging(input_resolution=[56,56], dim=96)
-    
-    out = patch_embedding(t) # [4, 56*56, 96]
+    patch_merging = PatchMerging(input_resolution=[56, 56], dim=96)
+
+    out = patch_embedding(t)  # [4, 56*56, 96]
     print('patch_embedding:', out.shape)
-    out = swin_block(out) # [4, 56*56, 96]
+    out = swin_block(out)  # [4, 56*56, 96]
     print('swin_block:', out.shape)
-    out = patch_merging(out) # [4,28*28,96*2]
+    out = patch_merging(out)  # [4,28*28,96*2]
     print('patch_merging:', out.shape)
-    
-    
+
+
 if __name__ == '__main__':
     main()
