@@ -96,8 +96,8 @@ class WindowAttention(nn.Layer):
         self.softmax = nn.Softmax(-1)
         self.qkv = nn.Linear(dim, 3 * dim)
         self.proj = nn.Linear(dim, dim)
-        
-        ###### BEGIN Class 6: Relative Position Bias
+
+        # Relative Position Bias相对位置偏差
         self.window_size = window_size
         self.relative_position_bias_table = paddle.create_parameter(
             shape=[(2*window_size-1)*(2*window_size-1), num_heads],
@@ -105,9 +105,10 @@ class WindowAttention(nn.Layer):
             default_initializer=nn.initializer.TruncatedNormal(std=.02))
         coord_h = paddle.arange(self.window_size)
         coord_w = paddle.arange(self.window_size)
-        coords = paddle.stack(paddle.meshgrid([coord_h, coord_w])) #[2, ws, ws]
-        coords = coords.flatten(1) #[2, ws*ws]
-        relative_coords = coords.unsqueeze(2) - coords.unsqueeze(1)
+        # ! 注意方法
+        coords = paddle.stack(paddle.meshgrid([coord_h, coord_w]))  # [2, ws, ws]
+        coords = coords.flatten(1)  # [2, ws*ws]
+        relative_coords = coords.unsqueeze(2) - coords.unsqueeze(1) # [2, ws*ws, ws*ws]列减行
         relative_coords = relative_coords.transpose([1, 2, 0])
         relative_coords[:, :, 0] += self.window_size - 1
         relative_coords[:, :, 1] += self.window_size - 1
@@ -115,25 +116,26 @@ class WindowAttention(nn.Layer):
         relative_coords[:, :, 0] *= 2*self.window_size - 1
         relative_coords_index = relative_coords.sum(2)
         print(relative_coords_index)
+        # register_buffer(name, value)将变量的值保存到内存中，可以通过name来访问,但不会被训练
         self.register_buffer('relative_coords_index', relative_coords_index)
-        ###### END Class 6: Relative Position Bias
 
-    #todo Relative Position Bias
+    # Relative Position Bias
     def get_relative_position_bias_from_index(self):
         table = self.relative_position_bias_table  # [2m-1 * 2m-1, num_heads]
         print('table shape=', table.shape)
-        index = self.relative_coords_index.reshape([-1]) # [M^2, M^2] - > [M^2*M^2]
+        # 已经加入缓冲区了所以可以self直接访问
+        index = self.relative_coords_index.reshape([-1])  # [M^2, M^2] - > [M^2*M^2]
         print('index shape =', index.shape)
-        relative_position_bias = paddle.index_select(x=table, index=index) # [M*M, M*M, num_heads]
-        return relative_position_bias  
-    
+        relative_position_bias = paddle.index_select(x=table, index=index)  # [M*M, M*M, num_heads]
+        return relative_position_bias
+
     def transpose_multi_head(self, x):
         new_shape = x.shape[:-1] + [self.num_heads, self.dim_head]
         x = x.reshape(new_shape)
         x = x.transpose([0, 2, 1, 3])  # [B, num_heads, num_patches, dim_head]
         return x
 
-    def forward(self, x, mask = None):
+    def forward(self, x, mask=None):
         # x: [B*num_windows, ws*ws, c]
         B, N, C = x.shape
         print('xshape=', x.shape)
@@ -141,16 +143,16 @@ class WindowAttention(nn.Layer):
         q, k, v = map(self.transpose_multi_head, qkv)
         q = q * self.scale
         attn = paddle.matmul(q, k, transpose_y=True)
-        # [B*num_windows, num_heads, num_patches, num_patches]  num_patches = windows_size * window_size = M * M 
+        # [B*num_windows, num_heads, num_patches, num_patches]  num_patches = windows_size * window_size = M * M
 
         print('attn shape=', attn.shape)
-        ###### BEGIN Class 6: Relative Position Bias
+        # BEGIN Class 6: Relative Position Bias
         relative_position_bias = self.get_relative_position_bias_from_index()
         relative_position_bias = relative_position_bias.reshape([self.window_size * self.window_size, self.window_size * self.window_size, -1])
         # [M*M, M*M, num_heads]
-        relative_position_bias = relative_position_bias.transpose([2, 0, 1]) #[num_heads, M*M, M*M]
+        relative_position_bias = relative_position_bias.transpose([2, 0, 1])  # [num_heads, M*M, M*M]
         attn = attn + relative_position_bias.unsqueeze(0)
-        ###### END Class 6: Relative Position Bias
+        # END Class 6: Relative Position Bias
         print('attn shape=', attn.shape)
 
         if mask is None:

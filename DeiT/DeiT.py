@@ -44,7 +44,7 @@ class PatchEmbedding(nn.Layer):
                                          kernel_size=patch_size,
                                          stride=patch_size)
         self.dropout = nn.Dropout(dropout)
-
+        # 此函数用于创建一个参数。该参数是一个可学习的变量，可以梯度，并可以优化。 
         self.cls_token = paddle.create_parameter(
             shape=[1, 1, embed_dim],
             dtype='float32',
