@@ -1,5 +1,6 @@
 import paddle
 import paddle.nn as nn
+from mask import generate_mask
 paddle.set_device('cpu')
 
 
@@ -28,15 +29,18 @@ class PatchMerging(nn.Layer):
     def forward(self, x):
         h, w = self.resolution
         b, _, c = x.shape
+        # [B, H, W, C]
         x = x.reshape([b, h, w, c])
-
+        # 实现Merge, 进行数据拆分, 得到多个数据Shape: [B, H//2, W//2, C]
         x0 = x[:, 0::2, 0::2, :]
         x1 = x[:, 0::2, 1::2, :]
         x2 = x[:, 1::2, 0::2, :]
         x3 = x[:, 1::2, 1::2, :]
-
-        x = paddle.concat([x0, x1, x2, x3], axis=-1)  # [b, h/2, w/2, 4c]
+        # 得到新的x数据:拼接拆分的数据得到Shape: [B, H//2, W//2, 4C]
+        x = paddle.concat([x0, x1, x2, x3], axis=-1)
+        # [B, (H//2)*(W//2), 4C]
         x = x.reshape([b, -1, 4*c])
+        # 利用已有的norm和线性层实现最后的Merge映射, 注意这里为PreNorm(先归一化哦)
         x = self.norm(x)
         x = self.reduction(x)
         return x
@@ -62,20 +66,23 @@ class Mlp(nn.Layer):
 # windows_partition不需要学习，所以定义一个方法就行
 def windows_partition(x, window_size):
     B, H, W, C = x.shape
+    # B, H/ws, ws, W/ws, ws, C
     x = x.reshape([B, H//window_size, window_size, W//window_size, window_size, C])
+    # B, H/ws, W/ws, ws, ws, c
     x = x.transpose([0, 1, 3, 2, 4, 5])
-    # [B, H/window_size, W/window_size, window_size, window_size, C]
+    # B * H/ws * W/ws, ws, ws, c
     x = x.reshape([-1, window_size, window_size, C])
-    # [B*H/window_size*W/window_size, window_size, window_size, C]
+    # x = x.reahspe([-1, window_size*window_size, C]) # [B*num_windows, ws*ws, C]
     return x
 
 
 # windows_partition反过程，把窗口拼接起来
 def windows_reverse(windows, window_size, H, W):
+    # windows: [B*num_windows, ws*ws, C]
     B = int(windows.shape[0] // (H/window_size * W/window_size))
     x = windows.reshape([B, H//window_size, W//window_size, window_size, window_size, -1])
-    x = x.transpose([0, 1, 3, 2, 4, 5])
-    x = x.reshape([B, H, W, -1])
+    x = x.transpose([0, 1, 3, 2, 4, 5])  # [B, H/ws, ws, W/ws, ws, C]
+    x = x.reshape([B, H, W, -1])  # [B, H, W, C]
     return x
 
 
@@ -89,41 +96,102 @@ class WindowAttention(nn.Layer):
         self.softmax = nn.Softmax(-1)
         self.qkv = nn.Linear(dim, 3 * dim)
         self.proj = nn.Linear(dim, dim)
+        
+        ###### BEGIN Class 6: Relative Position Bias
+        self.window_size = window_size
+        self.relative_position_bias_table = paddle.create_parameter(
+            shape=[(2*window_size-1)*(2*window_size-1), num_heads],
+            dtype='float32',
+            default_initializer=nn.initializer.TruncatedNormal(std=.02))
+        coord_h = paddle.arange(self.window_size)
+        coord_w = paddle.arange(self.window_size)
+        coords = paddle.stack(paddle.meshgrid([coord_h, coord_w])) #[2, ws, ws]
+        coords = coords.flatten(1) #[2, ws*ws]
+        relative_coords = coords.unsqueeze(2) - coords.unsqueeze(1)
+        relative_coords = relative_coords.transpose([1, 2, 0])
+        relative_coords[:, :, 0] += self.window_size - 1
+        relative_coords[:, :, 1] += self.window_size - 1
 
+        relative_coords[:, :, 0] *= 2*self.window_size - 1
+        relative_coords_index = relative_coords.sum(2)
+        print(relative_coords_index)
+        self.register_buffer('relative_coords_index', relative_coords_index)
+        ###### END Class 6: Relative Position Bias
+
+    #todo Relative Position Bias
+    def get_relative_position_bias_from_index(self):
+        table = self.relative_position_bias_table  # [2m-1 * 2m-1, num_heads]
+        print('table shape=', table.shape)
+        index = self.relative_coords_index.reshape([-1]) # [M^2, M^2] - > [M^2*M^2]
+        print('index shape =', index.shape)
+        relative_position_bias = paddle.index_select(x=table, index=index) # [M*M, M*M, num_heads]
+        return relative_position_bias  
+    
     def transpose_multi_head(self, x):
         new_shape = x.shape[:-1] + [self.num_heads, self.dim_head]
         x = x.reshape(new_shape)
         x = x.transpose([0, 2, 1, 3])  # [B, num_heads, num_patches, dim_head]
         return x
 
-    def forward(self, x):
+    def forward(self, x, mask = None):
+        # x: [B*num_windows, ws*ws, c]
         B, N, C = x.shape
-        # x:[B,num_patches,embed_dim]
-        qkv = self.qkv(x).chunk(3, -1)
+        print('xshape=', x.shape)
+        qkv = self.qkv(x).chunk(3, axis=-1)
         q, k, v = map(self.transpose_multi_head, qkv)
-
         q = q * self.scale
         attn = paddle.matmul(q, k, transpose_y=True)
-        attn = self.softmax(attn)
+        # [B*num_windows, num_heads, num_patches, num_patches]  num_patches = windows_size * window_size = M * M 
 
-        out = paddle.matmul(attn, v)  # [B, num_heads, num_patches, dim_head]
-        out = out.transpose([0, 2, 1, 3])  # [B, num_patches, num_heads, dim_head] num_heads*dim_head=embed_dim
+        print('attn shape=', attn.shape)
+        ###### BEGIN Class 6: Relative Position Bias
+        relative_position_bias = self.get_relative_position_bias_from_index()
+        relative_position_bias = relative_position_bias.reshape([self.window_size * self.window_size, self.window_size * self.window_size, -1])
+        # [M*M, M*M, num_heads]
+        relative_position_bias = relative_position_bias.transpose([2, 0, 1]) #[num_heads, M*M, M*M]
+        attn = attn + relative_position_bias.unsqueeze(0)
+        ###### END Class 6: Relative Position Bias
+        print('attn shape=', attn.shape)
+
+        if mask is None:
+            attn = self.softmax(attn)
+        else:
+            # mask: [num_windows, num_patches, num_patches]
+            # attn: [B*num_windows, num_heads, num_patches, num_patches]
+            # 将mask与attn相加，所以attn要reshape->[B, num_windows, num_heads, num_patches, num_patches]
+            attn = attn.reshape([x.shape[0]//mask.shape[0], mask.shape[0], self.num_heads, mask.shape[1], mask.shape[1]])
+            # mask: [1, num_windows, 1, num_patches, num_patches]与attn相对应再相加
+            attn = attn + mask.unsqueeze(1).unsqueeze(0)
+            # attn还原
+            attn = attn.reshape([-1, self.num_heads, mask.shape[1], mask.shape[1]])
+            attn = self.softmax(attn)
+
+        out = paddle.matmul(attn, v)
+        out = out.transpose([0, 2, 1, 3])
         out = out.reshape([B, N, C])
         out = self.proj(out)
         return out
 
 
 class SwinBlock(nn.Layer):
-    def __init__(self, dim, input_resolution, num_heads, window_size):
+    def __init__(self, dim, input_resolution, num_heads, window_size, shift_size=0):
         super().__init__()
         self.dim = dim
         self.resolution = input_resolution
         self.window_size = window_size
+        self.shift_size = shift_size
         self.attn_norm = nn.LayerNorm(dim)
         self.attn = WindowAttention(dim, window_size, num_heads)
 
         self.mlp_norm = nn.LayerNorm(dim)
         self.mlp = Mlp(dim)
+
+        # generate mask and register buffer
+        if self.shift_size > 0:
+            attn_mask = generate_mask(self.window_size, self.shift_size, input_resolution=self.resolution)
+        else:
+            attn_mask = None
+        self.register_buffer('attn_mask', attn_mask)
 
     def forward(self, x):
         H, W = self.resolution
@@ -133,12 +201,22 @@ class SwinBlock(nn.Layer):
         x = self.attn_norm(x)
 
         x = x.reshape([B, H, W, C])
-        x_windows = windows_partition(x, self.window_size)
-        # [B*num_patches, window_size, window_size, C]
+        # shift window
+        if self.shift_size > 0:
+            shifted_x = paddle.roll(x, shifts=(-self.shift_size, -self.shift_size), axis=(1, 2))
+        else:
+            shifted_x = x
+        # compute window attn
+        x_windows = windows_partition(shifted_x, self.window_size)
         x_windows = x_windows.reshape([-1, self.window_size*self.window_size, C])
-        attn_windows = self.attn(x_windows)
+        attn_windows = self.attn(x_windows, mask=self.attn_mask)
         attn_windows = attn_windows.reshape([-1, self.window_size, self.window_size, C])
-        x = windows_reverse(attn_windows, self.window_size, H, W)
+        shifted_x = windows_reverse(attn_windows, self.window_size, H, W)
+        # shift back
+        if self.shift_size > 0:
+            x = paddle.roll(shifted_x, shifts=(self.shift_size, self.shift_size), axis=(1, 2))
+        else:
+            x = shifted_x
         # [B, H, W, C]
         x = x.reshape([B, H*W, C])
         x = x + h
@@ -149,39 +227,21 @@ class SwinBlock(nn.Layer):
         return x
 
 
-# generator attn mask
-def generate_mask(window_size=4, shift_size=2, input_resolution=(8, 8)):
-    H, W = input_resolution
-    img_mask = paddle.zeros([1, H, W, 1])
-    h_slices = [slice(0, -window_size),
-                slice(-window_size, -shift_size),
-                slice(-shift_size, None)]  # a[slice(...)] = a[0:-window_size]
-    w_slices = [slice(0, -window_size),
-                slice(-window_size, -shift_size),
-                slice(-shift_size, None)]  # a[slice(...)] = a[0:-window_size]
-    cnt = 0
-    for h in h_slices:
-        for w in w_slices:
-            img_mask[:, h, w, :] = cnt
-            cnt += 1
-    window_mask = windows_partition(img_mask, window_size=window_size)
-    window_mask = window_mask.reshape([-1, window_size*window_size, 1]) # 拉平
-    # 列向量减行向量[n,1,ws*ws] - [n,ws*ws,1]
-    attn_mask = window_mask.unsqueeze(1)-window_mask.unsqueeze(2)
-
-
 def main():
     t = paddle.randn([4, 3, 224, 224])
     patch_embedding = PatchEmbedding(patch_size=4, embed_dim=96)
-    swin_block = SwinBlock(dim=96, input_resolution=[56, 56], num_heads=4, window_size=7)
+    swin_block_w_msa = SwinBlock(dim=96, input_resolution=[56, 56], num_heads=4, window_size=7, shift_size=0)
+    swin_block_sw_msa = SwinBlock(dim=96, input_resolution=[56, 56], num_heads=4, window_size=7, shift_size=7//2)
     patch_merging = PatchMerging(input_resolution=[56, 56], dim=96)
 
-    out = patch_embedding(t)  # [4, 56*56, 96]
-    print('patch_embedding:', out.shape)
-    out = swin_block(out)  # [4, 56*56, 96]
-    print('swin_block:', out.shape)
-    out = patch_merging(out)  # [4,28*28,96*2]
-    print('patch_merging:', out.shape)
+    print('image shape=[4, 3, 224, 224]')
+    out = patch_embedding(t)  # [4, 56,56,96]
+    print('patch embedding out shape:', out.shape)
+    out = swin_block_w_msa(out)  # [4, 56,56,96]
+    out = swin_block_sw_msa(out)  # [4, 56,56,96]
+    print('swin block out shape:', out.shape)
+    out = patch_merging(out)  # [4, 3, 224, 224]
+    print('patch merging out shape:', out.shape)
 
 
 if __name__ == '__main__':
